@@ -9,9 +9,6 @@ resolution via GenLayer's Optimistic Democracy consensus.
 from genlayer import *
 import json
 
-# ──────────────────────────────────────────────────────────────────────
-# Status Constants
-# ──────────────────────────────────────────────────────────────────────
 STATUS_CREATED = "CREATED"
 STATUS_FUNDED = "FUNDED"
 STATUS_DELIVERED = "DELIVERED"
@@ -39,15 +36,21 @@ class EscrowArbitrator(gl.Contract):
     is_active: bool
 
     def __init__(self, seller: Address, contract_terms: str):
-        """
-        Deploy the escrow contract.
-        Deployer is the buyer. Terms are permanently locked.
-        """
         self.buyer = gl.message.sender_address
-        self.seller = seller
-        self.contract_terms = contract_terms
 
-        # Initialize default milestones schema
+        # Robust Address parsing: handles raw int passed by Studio RPC, hex string, or Address object
+        if isinstance(seller, int):
+            hex_str = hex(seller)[2:]
+            self.seller = Address("0x" + hex_str.zfill(40))
+        elif isinstance(seller, str):
+            self.seller = Address(seller)
+        elif hasattr(seller, "as_bytes"):
+            self.seller = seller
+        else:
+            self.seller = Address(str(seller))
+
+        self.contract_terms = str(contract_terms)
+
         default_milestones = {
             "0": {
                 "title": "Initial Deliverable",
@@ -65,13 +68,8 @@ class EscrowArbitrator(gl.Contract):
         self.total_refunded_wei = "0"
         self.is_active = True
 
-    # ══════════════════════════════════════════════════════════════════
-    # FUNDING & MILESTONE SETUP
-    # ══════════════════════════════════════════════════════════════════
-
     @gl.public.write
     def add_milestone(self, milestone_id: str, title: str, description: str, amount_wei: str) -> None:
-        """Buyer adds a new milestone specification."""
         self._require_active()
         self._require_buyer()
 
@@ -88,13 +86,12 @@ class EscrowArbitrator(gl.Contract):
 
     @gl.public.write.payable
     def fund_milestone(self, milestone_id: str) -> None:
-        """Buyer deposits the required funds for a milestone."""
         self._require_active()
         self._require_buyer()
 
         milestones = json.loads(self.milestones_json)
         if milestone_id not in milestones:
-            raise gl.vm.UserError(f"Milestone {milestone_id} does not exist")
+            raise gl.vm.UserError("Milestone does not exist")
 
         ms = milestones[milestone_id]
         if ms["status"] != STATUS_CREATED:
@@ -107,13 +104,8 @@ class EscrowArbitrator(gl.Contract):
         new_dep = int(self.total_deposited_wei) + int(str(gl.message.value))
         self.total_deposited_wei = str(new_dep)
 
-    # ══════════════════════════════════════════════════════════════════
-    # DELIVERY & STRICT CONSENSUS URL VERIFICATION
-    # ══════════════════════════════════════════════════════════════════
-
     @gl.public.write
     def submit_deliverable(self, milestone_id: str, deliverable_url: str, delivery_notes: str) -> None:
-        """Seller submits work for a funded milestone."""
         self._require_active()
         self._require_seller()
 
@@ -133,10 +125,6 @@ class EscrowArbitrator(gl.Contract):
 
     @gl.public.write
     def verify_deliverable_url(self, milestone_id: str, expected_keyword: str) -> bool:
-        """
-        Consensus verification using strict_eq.
-        All validators fetch the deliverable URL and confirm the keyword matches identically.
-        """
         self._require_active()
         milestones = json.loads(self.milestones_json)
         if milestone_id not in milestones:
@@ -154,7 +142,6 @@ class EscrowArbitrator(gl.Contract):
 
     @gl.public.write
     def approve_milestone(self, milestone_id: str) -> None:
-        """Buyer approves deliverable and releases funds to seller."""
         self._require_active()
         self._require_buyer()
 
@@ -177,13 +164,8 @@ class EscrowArbitrator(gl.Contract):
         seller_ref = gl.get_contract_at(self.seller)
         seller_ref.emit_transfer(value=u256(amount_val), on="finalized")
 
-    # ══════════════════════════════════════════════════════════════════
-    # AI DISPUTE ARBITRATION (prompt_non_comparative)
-    # ══════════════════════════════════════════════════════════════════
-
     @gl.public.write
     def raise_dispute(self, milestone_id: str, claim: str, evidence_url: str) -> None:
-        """Buyer disputes the deliverable, providing evidence."""
         self._require_active()
         self._require_buyer()
 
@@ -212,7 +194,6 @@ class EscrowArbitrator(gl.Contract):
 
     @gl.public.write
     def submit_defense(self, milestone_id: str, defense: str, defense_url: str) -> None:
-        """Seller submits counter-evidence before arbitration can proceed."""
         self._require_active()
         self._require_seller()
 
@@ -228,11 +209,6 @@ class EscrowArbitrator(gl.Contract):
 
     @gl.public.write
     def arbitrate_dispute(self, milestone_id: str) -> str:
-        """
-        AI Arbitration Consensus primitive using prompt_non_comparative.
-        Validators evaluate the leader's ruling against the raw evidence
-        and original contract terms without wasteful duplicate generation.
-        """
         self._require_active()
 
         milestones = json.loads(self.milestones_json)
@@ -315,10 +291,6 @@ Respond strictly in JSON format:
         self.milestones_json = json.dumps(milestones)
         return json.dumps(ruling)
 
-    # ══════════════════════════════════════════════════════════════════
-    # VIEWS
-    # ══════════════════════════════════════════════════════════════════
-
     @gl.public.view
     def get_milestone(self, milestone_id: str) -> str:
         milestones = json.loads(self.milestones_json)
@@ -335,10 +307,6 @@ Respond strictly in JSON format:
             "refunded_wei": self.total_refunded_wei,
             "is_active": self.is_active
         })
-
-    # ══════════════════════════════════════════════════════════════════
-    # INTERNAL HELPERS
-    # ══════════════════════════════════════════════════════════════════
 
     def _require_buyer(self) -> None:
         if gl.message.sender_address != self.buyer:
