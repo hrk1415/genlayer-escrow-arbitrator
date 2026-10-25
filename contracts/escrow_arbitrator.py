@@ -4,6 +4,12 @@ Decentralized Escrow Arbitrator — GenLayer Intelligent Contract
 ===============================================================
 A production-grade, milestone-based escrow primitive with AI-powered dispute
 resolution via GenLayer's Optimistic Democracy consensus.
+
+Genuinely Evidence-Based Arbitration:
+The settlement path actively fetches and acquires the material evidence on-chain
+(deliverable URL, buyer's dispute evidence URL, and seller's counter-evidence URL)
+via gl.nondet.web, providing the full acquired evidence payload to the leader and
+validators to assess directly against the agreed contract terms.
 """
 
 from genlayer import *
@@ -22,7 +28,8 @@ STATUS_CANCELLED = "CANCELLED"
 
 class EscrowArbitrator(gl.Contract):
     """
-    Milestone-based escrow primitive with AI consensus arbitration.
+    Milestone-based escrow primitive with AI consensus arbitration
+    grounded in on-chain acquired material evidence.
     """
 
     buyer: Address
@@ -188,7 +195,8 @@ class EscrowArbitrator(gl.Contract):
             "seller_defense": "",
             "seller_url": "",
             "ruling": "",
-            "reasoning": ""
+            "reasoning": "",
+            "evidence_validation_summary": ""
         }
         self.evidence_json = json.dumps(ev_all)
 
@@ -209,6 +217,18 @@ class EscrowArbitrator(gl.Contract):
 
     @gl.public.write
     def arbitrate_dispute(self, milestone_id: str) -> str:
+        """
+        Genuinely Evidence-Based AI Dispute Arbitration via GenLayer Consensus.
+
+        Instead of resolving disputes solely based on text claims, this settlement
+        path acquires the material evidence on-chain by fetching:
+          1. The deliverable work from `deliverable_url`
+          2. The buyer's submitted evidence from `buyer_url`
+          3. The seller's counter-defense evidence from `seller_url`
+
+        The leader and validators independently assess this acquired material evidence
+        against the agreed contract terms using `prompt_non_comparative`.
+        """
         self._require_active()
 
         milestones = json.loads(self.milestones_json)
@@ -227,32 +247,78 @@ class EscrowArbitrator(gl.Contract):
         if not ev["seller_defense"]:
             raise gl.vm.UserError("Seller must submit defense before arbitration")
 
-        context = json.dumps({
-            "contract_terms": self.contract_terms,
-            "milestone_title": ms["title"],
-            "deliverable_url": ms["deliverable_url"],
-            "buyer_claim": ev["buyer_claim"],
-            "seller_defense": ev["seller_defense"]
-        })
+        deliverable_url = ms.get("deliverable_url", "")
+        buyer_url = ev.get("buyer_url", "")
+        seller_url = ev.get("seller_url", "")
 
         def generate_ruling():
-            prompt = f"""You are an impartial arbitrator evaluating a contract dispute.
-Analyze all evidence against the contract terms and deliver a fair ruling.
+            # 1. On-chain Material Evidence Acquisition
+            def safe_fetch(url: str, max_chars: int = 3500) -> str:
+                if not url or not (url.startswith("http://") or url.startswith("https://")):
+                    return "[No valid URL provided]"
+                try:
+                    data = gl.nondet.web.render(url, mode="html")
+                    if not data:
+                        return "[Empty response from URL]"
+                    return data[:max_chars]
+                except Exception as e:
+                    return f"[Failed to acquire evidence from URL: {str(e)}]"
 
-Context:
-{context}
+            # Fetch the actual contents of the evidence and deliverable URLs
+            deliverable_content = safe_fetch(deliverable_url)
+            buyer_evidence_content = safe_fetch(buyer_url)
+            seller_evidence_content = safe_fetch(seller_url)
+
+            dispute_payload = {
+                "contract_terms": self.contract_terms,
+                "milestone_title": ms["title"],
+                "milestone_amount_wei": ms["amount_wei"],
+                "claims": {
+                    "buyer_claim": ev["buyer_claim"],
+                    "buyer_evidence_url": buyer_url,
+                    "seller_defense": ev["seller_defense"],
+                    "seller_defense_url": seller_url
+                },
+                "acquired_material_evidence": {
+                    "deliverable_url": deliverable_url,
+                    "deliverable_content_excerpt": deliverable_content,
+                    "buyer_evidence_content_excerpt": buyer_evidence_content,
+                    "seller_evidence_content_excerpt": seller_evidence_content
+                }
+            }
+
+            prompt = f"""You are an impartial decentralized arbitrator evaluating a contract dispute.
+You must assess the ACQUIRED MATERIAL EVIDENCE fetched directly from the submitted URLs against the agreed contract terms.
+
+Dispute File and Acquired Material Evidence:
+{json.dumps(dispute_payload, indent=2)}
+
+Instructions:
+1. Examine the acquired deliverable content to see if the work actually satisfies the agreed contract terms.
+2. Examine the acquired buyer evidence content to see if their defect claims are substantiated by the fetched material.
+3. Examine the acquired seller evidence content to see if their defense is substantiated by the fetched material.
+4. Base your ruling on the real acquired evidence content, NOT merely on what either party asserts.
+5. Provide clear reasoning explaining how the fetched evidence relates to the contract terms.
 
 Respond strictly in JSON format:
 {{
   "ruling": "BUYER" | "SELLER" | "SPLIT",
-  "reasoning": "Explanation citing contract terms and evidence"
+  "reasoning": "Detailed reasoning explaining how the acquired evidence from the URLs confirms or refutes the claims against the contract terms",
+  "evidence_validation_summary": "Summary of findings from deliverable, buyer evidence, and seller evidence contents"
 }}"""
+
             return gl.nondet.exec_prompt(prompt, response_format="json")
 
         ruling_raw = gl.eq_principle.prompt_non_comparative(
             generate_ruling,
-            task="Evaluate whether this dispute ruling is fair and grounded in contract terms.",
-            criteria="The ruling must be BUYER, SELLER, or SPLIT, and cite specific terms."
+            task="Audit the dispute ruling to ensure it thoroughly evaluates the acquired evidence content against the contract terms.",
+            criteria=(
+                "The ruling must: "
+                "(1) Be one of BUYER, SELLER, or SPLIT. "
+                "(2) Explicitly analyze the acquired evidence fetched from the submitted URLs. "
+                "(3) Verify whether the deliverable content satisfies the contract terms based on the fetched evidence rather than unverified claims. "
+                "(4) Provide a coherent explanation linking the acquired evidence to the decision."
+            )
         )
 
         ruling = ruling_raw if isinstance(ruling_raw, dict) else json.loads(str(ruling_raw))
@@ -261,6 +327,7 @@ Respond strictly in JSON format:
 
         ev["ruling"] = decision
         ev["reasoning"] = ruling.get("reasoning", "")
+        ev["evidence_validation_summary"] = ruling.get("evidence_validation_summary", "")
         ev_all[milestone_id] = ev
         self.evidence_json = json.dumps(ev_all)
 
