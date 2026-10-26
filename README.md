@@ -1,42 +1,51 @@
 # Decentralized Escrow Arbitrator
 
-**A production-grade, milestone-based escrow primitive with on-chain evidence acquisition and AI dispute arbitration for GenLayer.**
+**A production-grade, milestone-based escrow primitive with on-chain evidence acquisition, fail-closed AI arbitration, and enforced escrow invariants for GenLayer.**
 
-> Built on GenLayer's Optimistic Democracy consensus. Solves trustless conditional payments with dispute resolution by actively acquiring and evaluating material dispute evidence against written contract terms.
-
----
-
-## Why This Contract Matters
-
-Traditional escrow contracts either rely on centralized third-party arbiters or lock funds behind rigid programmatic rules that cannot assess the quality of delivered work. Meanwhile, naive "AI escrow" demos merely pass raw text claims into an LLM and let an AI arbitrarily decide who gets paid without looking at real evidence.
-
-**This contract solves this critical flaw through genuine, on-chain Evidence-Based Arbitration:**
-1. **On-Chain Evidence Acquisition**: During arbitration, the contract fetches the actual material evidence from the web (`gl.nondet.web.render`) for:
-   - The submitted deliverable URL
-   - The buyer's defect/complaint evidence URL (e.g., test failures, error logs)
-   - The seller's counter-defense evidence URL (e.g., CI/CD reports, deployment proofs)
-2. **Validator Consensus on Acquired Evidence**: Both the leader node and committee validators receive the complete acquired evidence payload and independently audit whether the deliverable conforms to the agreed contract terms.
-3. **Structured & Auditable Rulings**: Output is constrained to strict JSON (`BUYER`, `SELLER`, or `SPLIT`), accompanied by specific citations of contract terms and an `evidence_validation_summary`.
+> Built natively on GenLayer's Optimistic Democracy consensus. Designed as an unexploitable, reusable building block for freelancing platforms, bounty systems, and service agreements.
 
 ---
 
-## Architecture
+## Enforced Escrow Invariants
 
-### State Machine (Per Milestone)
+This contract enforces four fundamental cryptographic and financial invariants:
+
+1. **Strict Deposit Equality**:
+   - `add_milestone()` strictly validates that `amount_wei` is a positive integer (`> 0`).
+   - `fund_milestone()` verifies that the caller's actual deposit value (`gl.message.value`) exactly equals the milestone's required positive amount before transitioning to `STATUS_FUNDED`.
+   - Records the exact deposited funds in `escrowed_wei`.
+
+2. **Lifecycle Record Immutability**:
+   - `add_milestone()` strictly prevents overwriting any existing milestone ID, preserving milestone history and preventing griefing/fund misdirection.
+
+3. **Fail-Closed On-Chain Evidence Acquisition**:
+   - Arbitration (`arbitrate_dispute()`) actively acquires material evidence on-chain via `gl.nondet.web.render()` for:
+     1. The submitted deliverable URL
+     2. The buyer's dispute evidence URL
+     3. The seller's counter-defense URL
+   - **Fail-Closed Guarantee**: If any of the required URLs are missing, malformed, or fail to return acquired content, arbitration aborts immediately with a `UserError`. **Zero funds are transferred, and escrowed balances remain preserved.**
+
+4. **Fund Conservation & Payout Bounding**:
+   - Both `approve_milestone()` and `arbitrate_dispute()` verify that positive `escrowed_wei` exists.
+   - Payouts are strictly bounded by `escrowed_wei` and clear the balance upon execution to guarantee that approval and dispute settlement can **never pay more than the amount escrowed for that milestone**.
+
+---
+
+## State Machine (Per Milestone)
 
 ```
-CREATED ──fund_milestone──► FUNDED ──submit_deliverable──► DELIVERED ──approve_milestone──► APPROVED
-                               │                               │                           (funds → seller)
-                               │                               │
-                               ▼                               ▼
-                           CANCELLED                       DISPUTED ──arbitrate_dispute──► RESOLVED_BUYER
-                           (refund → buyer)                    │                           (refund → buyer)
-                                                               │
-                                                               ├─────────────────────────► RESOLVED_SELLER
-                                                               │                           (funds → seller)
-                                                               │
-                                                               └─────────────────────────► RESOLVED_SPLIT
-                                                                                           (proportional split)
+CREATED ──fund_milestone (exact deposit)──► FUNDED ──submit_deliverable──► DELIVERED
+                                              │                               │
+                                              ▼                               ▼
+                                          CANCELLED                       DISPUTED
+                                       (refund to buyer)                      │
+                                                                 arbitrate_dispute()
+                                                         (fail-closed evidence acquisition)
+                                                                              │
+                                                      ┌───────────────────────┼───────────────────────┐
+                                                      ▼                       ▼                       ▼
+                                                RESOLVED_BUYER          RESOLVED_SELLER         RESOLVED_SPLIT
+                                             (escrowed → buyer)      (escrowed → seller)      (50/50 exact split)
 ```
 
 ---
@@ -56,28 +65,15 @@ result = gl.eq_principle.strict_eq(check_url_live)
 - **Purpose**: Verifies that a deliverable link is live and contains required keywords.
 - **Why `strict_eq`**: Deterministic boolean check where all validators must agree on the identical byte-for-byte outcome.
 
-### 2. `prompt_non_comparative` — Material Evidence-Based Arbitration
+### 2. `prompt_non_comparative` — Fail-Closed Material Evidence Arbitration
 ```python
 def generate_ruling():
-    # 1. On-Chain Material Evidence Acquisition
-    deliverable_content = safe_fetch(deliverable_url)
-    buyer_evidence_content = safe_fetch(buyer_url)
-    seller_evidence_content = safe_fetch(seller_url)
+    # Fail-closed acquisition: aborts if any evidence is missing or fails to fetch
+    deliverable_content = acquire_evidence_strict(deliverable_url, "deliverable evidence")
+    buyer_evidence_content = acquire_evidence_strict(buyer_url, "buyer dispute evidence")
+    seller_evidence_content = acquire_evidence_strict(seller_url, "seller defense evidence")
 
-    dispute_payload = {
-        "contract_terms": self.contract_terms,
-        "milestone_title": ms["title"],
-        "claims": {
-            "buyer_claim": ev["buyer_claim"],
-            "seller_defense": ev["seller_defense"]
-        },
-        "acquired_material_evidence": {
-            "deliverable_content_excerpt": deliverable_content,
-            "buyer_evidence_content_excerpt": buyer_evidence_content,
-            "seller_evidence_content_excerpt": seller_evidence_content
-        }
-    }
-    ...
+    dispute_payload = { ... }
     return gl.nondet.exec_prompt(prompt, response_format="json")
 
 ruling = gl.eq_principle.prompt_non_comparative(
@@ -86,8 +82,6 @@ ruling = gl.eq_principle.prompt_non_comparative(
     criteria="The ruling must: (1) Be BUYER, SELLER, or SPLIT. (2) Explicitly analyze acquired evidence fetched from submitted URLs. (3) Verify deliverable conformity against contract terms."
 )
 ```
-- **Purpose**: Evaluates contested milestones and determines fund allocation.
-- **Why `prompt_non_comparative`**: Open-ended evaluation grounded in source evidence. Validators do not waste compute regenerating separate text; instead, they audit whether the leader's proposed ruling is logically substantiated by the acquired web evidence and the original contract terms.
 
 ---
 
@@ -100,42 +94,35 @@ EscrowArbitrator(
     contract_terms: str
 )
 ```
-- Deployer automatically becomes the `buyer`.
-- Automatically initializes Milestone 0 with the agreed terms.
 
 ### Public Write Methods
 | Method | Caller | Consensus | Description |
 |--------|--------|-----------|-------------|
-| `add_milestone(id, title, desc, amount_wei)` | Buyer | None | Defines a new milestone specification |
-| `fund_milestone(id)` | Buyer (payable) | None | Deposits funds for a specific milestone |
-| `submit_deliverable(id, url, notes)` | Seller | None | Submits work for a funded milestone |
-| `verify_deliverable_url(id, keyword)` | Any | `strict_eq` | Verifies deliverable link is live and valid |
-| `approve_milestone(id)` | Buyer | None | Releases milestone funds directly to seller |
-| `raise_dispute(id, claim, evidence_url)` | Buyer | None | Initiates dispute with supporting proof URL |
-| `submit_defense(id, defense, defense_url)` | Seller | None | Submits counter-evidence proof URL |
-| `arbitrate_dispute(id)` | Any | `prompt_non_comparative` | **Acquires material evidence on-chain & arbitrates** |
-
-### Public View Methods
-| Method | Returns | Description |
-|--------|---------|-------------|
-| `get_milestone(id)` | JSON string | Milestone details, status, and deliverable URL |
-| `get_contract_summary()` | JSON string | Aggregate balances, terms, parties, and contract state |
+| `add_milestone(id, title, desc, amount_wei)` | Buyer | None | Adds new milestone; prevents overwriting and requires amount > 0 |
+| `fund_milestone(id)` | Buyer (payable) | None | Requires exact deposit (`gl.message.value == amount_wei`) |
+| `submit_deliverable(id, url, notes)` | Seller | None | Submits deliverable with valid HTTP/HTTPS URL |
+| `verify_deliverable_url(id, keyword)` | Any | `strict_eq` | Deterministically verifies deliverable link is live |
+| `approve_milestone(id)` | Buyer | None | Releases escrowed balance to seller; clears escrowed amount |
+| `raise_dispute(id, claim, evidence_url)` | Buyer | None | Initiates dispute with validated evidence URL |
+| `submit_defense(id, defense, defense_url)` | Seller | None | Submits counter-defense with validated evidence URL |
+| `arbitrate_dispute(id)` | Any | `prompt_non_comparative` | **Acquires material evidence on-chain (fails closed if missing); settles bounded by escrowed balance** |
 
 ---
 
 ## Testing
 
-Run direct execution unit tests:
+Run direct execution unit tests verifying all four invariants:
 ```bash
 pytest tests/test_escrow_arbitrator.py -v
 ```
 
 Tests cover:
 - Contract initialization and party binding
-- State machine transitions (CREATED -> FUNDED -> DELIVERED -> DISPUTED)
-- Evidence and defense URL submissions
-- Arbitration pre-condition validation (preventing one-sided resolution)
-- Evidence validation summary schema integrity
+- Rejection of deposit mismatch during funding
+- Prevention of milestone lifecycle overwrites in `add_milestone`
+- Rejection of non-positive milestone amounts
+- Fail-closed behavior when evidence cannot be acquired
+- Bounded payout invariant preventing overpayment or double settlement
 
 ---
 
